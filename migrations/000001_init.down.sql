@@ -1,0 +1,11 @@
+DROP INDEX IF EXISTS idx_pending_posts_topic;
+DROP INDEX IF EXISTS idx_posts_expires;
+
+DROP TABLE IF EXISTS payments;
+DROP TABLE IF EXISTS posts;
+DROP TABLE IF EXISTS pending_posts;
+DROP TABLE IF EXISTS users;
+DROP TABLE IF EXISTS topics;
+DROP TABLE IF EXISTS groups;
+
+DROP TYPE IF EXISTS user_state;
