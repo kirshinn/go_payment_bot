@@ -75,9 +75,9 @@ func main() {
 		return update.PreCheckoutQuery != nil
 	}, h.OnPreCheckout)
 
-	// Проверка просроченных постов каждый час
+	// Проверка просроченных постов каждые 5 минут
 	go func() {
-		ticker := time.NewTicker(time.Hour)
+		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 		for {
 			select {
