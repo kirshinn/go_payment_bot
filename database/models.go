@@ -6,6 +6,7 @@ type UserState string
 
 const (
 	StateNone              UserState = "none"
+	StateWaitingEmail      UserState = "waiting_email"
 	StateWaitingPayment    UserState = "waiting_payment"
 	StateWaitingContent    UserState = "waiting_content"
 	StateWaitingModeration UserState = "waiting_moderation"
@@ -38,9 +39,12 @@ type User struct {
 	Username       *string
 	FirstName      *string
 	LastName       *string
+	Email          *string
+	EmailDeclined  bool
 	State          UserState
 	CurrentTopicID *int
 	PaidAt         *time.Time
+	ReceiptSentAt  *time.Time
 	BannedAt       *time.Time
 	BanReason      *string
 	CreatedAt      time.Time
