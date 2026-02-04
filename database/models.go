@@ -88,3 +88,22 @@ type ExpiredPost struct {
 	UserID    int64
 	ExpiresAt time.Time
 }
+
+type SpamViolation struct {
+	ID            int
+	UserID        int64
+	GroupID       int64
+	TopicID       *int
+	MessageText   *string
+	ViolationType string
+	MatchFound    *string
+	CreatedAt     time.Time
+}
+
+type AllowedDomain struct {
+	ID          int
+	Domain      string
+	Description *string
+	IsActive    bool
+	CreatedAt   time.Time
+}

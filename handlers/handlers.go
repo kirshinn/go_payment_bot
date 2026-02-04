@@ -12,6 +12,7 @@ import (
 	"go_payment_bot/config"
 	"go_payment_bot/database"
 	"go_payment_bot/messages"
+	"go_payment_bot/moderation"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -19,10 +20,11 @@ import (
 )
 
 type Handler struct {
-	bot         *bot.Bot
-	cfg         *config.Config
-	db          *database.DB
-	botUsername string
+	bot            *bot.Bot
+	cfg            *config.Config
+	db             *database.DB
+	botUsername    string
+	allowedDomains []string
 }
 
 func New(b *bot.Bot, cfg *config.Config, db *database.DB, username string) *Handler {
@@ -40,11 +42,25 @@ func (h *Handler) OnMessage(ctx context.Context, b *bot.Bot, update *models.Upda
 		return
 	}
 
-	// Проверяем, это сообщение в отслеживаемой теме?
+	// === МОДЕРАЦИЯ СПАМА ВО ВСЕХ ТОПИКАХ ===
+	if msg.Chat.Type == "supergroup" && msg.From != nil && !msg.From.IsBot {
+		text := msg.Text
+		if msg.Caption != "" {
+			text = msg.Caption
+		}
+
+		if text != "" {
+			if violation := moderation.Check(text, h.allowedDomains); violation != nil {
+				h.handleSpamViolation(ctx, msg, violation)
+				return
+			}
+		}
+	}
+
+	// Проверяем, это сообщение в отслеживаемой теме (платные объявления)?
 	if msg.Chat.Type == "supergroup" && msg.MessageThreadID != 0 {
 		topic, err := h.db.GetTopicByGroupAndTopicID(ctx, msg.Chat.ID, msg.MessageThreadID)
 		if err == nil && topic.IsActive {
-			// Это отслеживаемая тема
 			if msg.From != nil && !msg.From.IsBot {
 				h.onServicesTopicMessage(ctx, msg, topic)
 			}
@@ -400,6 +416,66 @@ func (h *Handler) DeleteExpiredPosts(ctx context.Context) {
 		_ = h.db.MarkPostDeleted(ctx, p.ID)
 		log.Printf("Удалён пост %d (chat=%d)", p.MessageID, p.ChatID)
 	}
+}
+
+func (h *Handler) handleSpamViolation(ctx context.Context, msg *models.Message, violation *moderation.Violation) {
+	// Удаляем сообщение
+	_, err := h.bot.DeleteMessage(ctx, &bot.DeleteMessageParams{
+		ChatID:    msg.Chat.ID,
+		MessageID: msg.ID,
+	})
+	if err != nil {
+		log.Printf("Ошибка удаления спам-сообщения: %v", err)
+	}
+
+	// Сохраняем нарушение в БД
+	text := msg.Text
+	if msg.Caption != "" {
+		text = msg.Caption
+	}
+	var topicID *int
+	if msg.MessageThreadID != 0 {
+		topicID = &msg.MessageThreadID
+	}
+	_ = h.db.CreateSpamViolation(ctx, msg.From.ID, msg.Chat.ID, topicID, text, string(violation.Type), violation.Match)
+
+	// Отправляем предупреждение в топик
+	warning, err := h.bot.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID:          msg.Chat.ID,
+		MessageThreadID: msg.MessageThreadID,
+		Text: fmt.Sprintf(`<a href="tg://user?id=%d">%s</a>, ваше сообщение удалено.
+
+⚠️ Публикация номеров телефонов, личных контактов и коротких ссылок запрещена.
+
+Коммерческие объявления — только в разделе «Услуги».`,
+			msg.From.ID, msg.From.FirstName),
+		ParseMode: models.ParseModeHTML,
+	})
+	if err != nil {
+		log.Printf("Ошибка отправки предупреждения: %v", err)
+		return
+	}
+
+	// Удаляем предупреждение через 30 сек
+	go func() {
+		time.Sleep(30 * time.Second)
+		_, _ = h.bot.DeleteMessage(context.Background(), &bot.DeleteMessageParams{
+			ChatID:    msg.Chat.ID,
+			MessageID: warning.ID,
+		})
+	}()
+
+	log.Printf("Спам от user=%d: type=%s match=%s", msg.From.ID, violation.Type, violation.Match)
+}
+
+func (h *Handler) LoadAllowedDomains(ctx context.Context) {
+	domains, err := h.db.GetAllowedDomains(ctx)
+	if err != nil {
+		log.Printf("Ошибка загрузки разрешённых доменов: %v", err)
+		return
+	}
+	h.allowedDomains = domains
+	log.Printf("Загружено %d разрешённых доменов", len(domains))
 }
 
 // Хелпер для указателя на строку

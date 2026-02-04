@@ -237,3 +237,57 @@ func (db *DB) CreatePayment(ctx context.Context, userID int64, topicID int, tele
 	)
 	return &p, err
 }
+
+// ============================================
+// Spam Violations
+// ============================================
+
+func (db *DB) CreateSpamViolation(ctx context.Context, userID, groupID int64, topicID *int, messageText, violationType, matchFound string) error {
+	query := `
+		INSERT INTO spam_violations (user_id, group_id, topic_id, message_text, violation_type, match_found)
+		VALUES ($1, $2, $3, $4, $5, $6)`
+	_, err := db.Pool.Exec(ctx, query, userID, groupID, topicID, messageText, violationType, matchFound)
+	return err
+}
+
+func (db *DB) GetUserViolationsCount(ctx context.Context, userID int64, since time.Time) (int, error) {
+	query := `SELECT COUNT(*) FROM spam_violations WHERE user_id = $1 AND created_at > $2`
+	var count int
+	err := db.Pool.QueryRow(ctx, query, userID, since).Scan(&count)
+	return count, err
+}
+
+// ============================================
+// Allowed Domains
+// ============================================
+
+func (db *DB) GetAllowedDomains(ctx context.Context) ([]string, error) {
+	query := `SELECT domain FROM allowed_domains WHERE is_active = TRUE`
+	rows, err := db.Pool.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var domains []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return nil, err
+		}
+		domains = append(domains, d)
+	}
+	return domains, rows.Err()
+}
+
+func (db *DB) AddAllowedDomain(ctx context.Context, domain, description string) error {
+	query := `INSERT INTO allowed_domains (domain, description) VALUES ($1, $2) ON CONFLICT (domain) DO NOTHING`
+	_, err := db.Pool.Exec(ctx, query, domain, description)
+	return err
+}
+
+func (db *DB) RemoveAllowedDomain(ctx context.Context, domain string) error {
+	query := `UPDATE allowed_domains SET is_active = FALSE WHERE domain = $1`
+	_, err := db.Pool.Exec(ctx, query, domain)
+	return err
+}

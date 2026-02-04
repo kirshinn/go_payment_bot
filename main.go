@@ -60,6 +60,23 @@ func main() {
 
 	h := handlers.New(b, cfg, db, botUsername)
 
+	// Загружаем разрешённые домены
+	h.LoadAllowedDomains(ctx)
+
+	// Перезагрузка каждый час (опционально)
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				h.LoadAllowedDomains(context.Background())
+			}
+		}
+	}()
+
 	b.RegisterHandler(bot.HandlerTypeMessageText, "", bot.MatchTypePrefix, h.OnMessage)
 	b.RegisterHandler(bot.HandlerTypeCallbackQueryData, "", bot.MatchTypePrefix, h.OnCallback)
 
