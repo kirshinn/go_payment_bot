@@ -6,6 +6,7 @@ CREATE TYPE user_state AS ENUM (
     'waiting_email',
     'waiting_payment',
     'waiting_content',
+    'waiting_confirm',
     'waiting_moderation',
     'banned'
 );

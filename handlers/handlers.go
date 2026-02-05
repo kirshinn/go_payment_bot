@@ -20,14 +20,32 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// PendingContent хранит контент объявления до подтверждения
+type PendingContent struct {
+	Text       string
+	PhotoIDs   []string
+	ReceivedAt time.Time
+}
+
+// MediaGroupData хранит данные о фото из media group
+type MediaGroupData struct {
+	PhotoIDs  []string
+	Text      string
+	UserID    int64
+	Timer     *time.Timer
+	Processed bool
+}
+
 type Handler struct {
 	bot             *bot.Bot
 	cfg             *config.Config
 	db              *database.DB
 	botUsername     string
 	allowedDomains  []string
-	mediaGroupCache map[string]bool
+	mediaGroupCache map[string]*MediaGroupData // MediaGroupID -> данные группы
 	mediaGroupMu    sync.Mutex
+	pendingContent  map[int64]*PendingContent // UserID -> контент для предпросмотра
+	pendingMu       sync.Mutex
 }
 
 func New(b *bot.Bot, cfg *config.Config, db *database.DB, username string) *Handler {
@@ -36,7 +54,8 @@ func New(b *bot.Bot, cfg *config.Config, db *database.DB, username string) *Hand
 		cfg:             cfg,
 		db:              db,
 		botUsername:     username,
-		mediaGroupCache: make(map[string]bool),
+		mediaGroupCache: make(map[string]*MediaGroupData),
+		pendingContent:  make(map[int64]*PendingContent),
 	}
 }
 
@@ -90,6 +109,18 @@ func (h *Handler) OnCallback(ctx context.Context, b *bot.Bot, update *models.Upd
 
 	_, _ = b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{CallbackQueryID: cb.ID})
 
+	// Подтверждение публикации
+	if cb.Data == "confirm_publish" {
+		h.handleConfirmPublish(ctx, cb)
+		return
+	}
+
+	// Загрузить заново
+	if cb.Data == "reload_content" {
+		h.handleReloadContent(ctx, cb)
+		return
+	}
+
 	// Формат: skip_email_<topic_id>
 	if strings.HasPrefix(cb.Data, "skip_email_") {
 		topicIDStr := strings.TrimPrefix(cb.Data, "skip_email_")
@@ -129,6 +160,192 @@ func (h *Handler) OnCallback(ctx context.Context, b *bot.Bot, update *models.Upd
 		}
 		h.sendInvoice(ctx, cb.From.ID, topicID)
 	}
+}
+
+// deleteCallbackMessage безопасно удаляет сообщение из callback
+func (h *Handler) deleteCallbackMessage(ctx context.Context, cb *models.CallbackQuery) {
+	// MaybeInaccessibleMessage — обращаемся к полю Message
+	if cb.Message.Message != nil {
+		_, _ = h.bot.DeleteMessage(ctx, &bot.DeleteMessageParams{
+			ChatID:    cb.From.ID,
+			MessageID: cb.Message.Message.ID,
+		})
+	}
+}
+
+// handleConfirmPublish обрабатывает подтверждение публикации
+func (h *Handler) handleConfirmPublish(ctx context.Context, cb *models.CallbackQuery) {
+	userID := cb.From.ID
+
+	// Удаляем сообщение с кнопками
+	h.deleteCallbackMessage(ctx, cb)
+
+	// Получаем пользователя
+	user, err := h.db.GetUser(ctx, userID)
+	if err != nil || user.CurrentTopicID == nil {
+		h.send(ctx, userID, messages.MsgError)
+		return
+	}
+
+	// Проверяем состояние
+	if user.State != database.StateWaitingConfirm {
+		h.send(ctx, userID, "❌ Объявление уже опубликовано или отменено.")
+		return
+	}
+
+	// Получаем сохранённый контент
+	content := h.getPendingContent(userID)
+	if content == nil {
+		h.send(ctx, userID, "❌ Контент не найден. Отправьте объявление заново.")
+		_ = h.db.UpdateUserState(ctx, userID, database.StateWaitingContent, user.CurrentTopicID)
+		return
+	}
+
+	topic, err := h.db.GetTopicByID(ctx, *user.CurrentTopicID)
+	if err != nil {
+		h.send(ctx, userID, messages.MsgError)
+		return
+	}
+
+	// Если модерация включена
+	if topic.ModerationEnabled {
+		_, err := h.db.CreatePendingPost(ctx, userID, topic.ID, &content.Text, content.PhotoIDs)
+		if err != nil {
+			h.send(ctx, userID, messages.MsgError)
+			return
+		}
+		_ = h.db.UpdateUserState(ctx, userID, database.StateWaitingModeration, user.CurrentTopicID)
+		h.clearPendingContent(userID)
+		h.send(ctx, userID, "⏳ Ваше объявление отправлено на модерацию.")
+		return
+	}
+
+	// Публикуем
+	h.send(ctx, userID, messages.MsgContentAccepted)
+	h.publishPost(ctx, userID, user, topic, content)
+}
+
+// handleReloadContent обрабатывает запрос на повторную загрузку
+func (h *Handler) handleReloadContent(ctx context.Context, cb *models.CallbackQuery) {
+	userID := cb.From.ID
+
+	// Удаляем сообщение с кнопками
+	h.deleteCallbackMessage(ctx, cb)
+
+	// Получаем пользователя
+	user, err := h.db.GetUser(ctx, userID)
+	if err != nil || user.CurrentTopicID == nil {
+		h.send(ctx, userID, messages.MsgError)
+		return
+	}
+
+	// Очищаем сохранённый контент
+	h.clearPendingContent(userID)
+
+	// Возвращаем в состояние ожидания контента
+	_ = h.db.UpdateUserState(ctx, userID, database.StateWaitingContent, user.CurrentTopicID)
+
+	topic, err := h.db.GetTopicByID(ctx, *user.CurrentTopicID)
+	if err != nil {
+		h.send(ctx, userID, messages.MsgError)
+		return
+	}
+
+	h.send(ctx, userID, messages.FormatReloadContent(topic.MaxPhotos))
+}
+
+// publishPost публикует объявление в группу
+func (h *Handler) publishPost(ctx context.Context, userID int64, user *database.User, topic *database.Topic, content *PendingContent) {
+	formattedText := h.formatPostFromContent(userID, content)
+	var sentMsg *models.Message
+	var err error
+
+	if len(content.PhotoIDs) == 0 {
+		// Только текст
+		sentMsg, err = h.bot.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID:          topic.GroupID,
+			MessageThreadID: topic.TopicID,
+			Text:            formattedText,
+			ParseMode:       models.ParseModeHTML,
+		})
+	} else if len(content.PhotoIDs) == 1 {
+		// Одно фото
+		sentMsg, err = h.bot.SendPhoto(ctx, &bot.SendPhotoParams{
+			ChatID:          topic.GroupID,
+			MessageThreadID: topic.TopicID,
+			Photo:           &models.InputFileString{Data: content.PhotoIDs[0]},
+			Caption:         formattedText,
+			ParseMode:       models.ParseModeHTML,
+		})
+	} else {
+		// Несколько фото - используем SendMediaGroup
+		media := make([]models.InputMedia, len(content.PhotoIDs))
+		for i, photoID := range content.PhotoIDs {
+			inputPhoto := &models.InputMediaPhoto{
+				Media: photoID,
+			}
+			// Подпись только к первому фото
+			if i == 0 {
+				inputPhoto.Caption = formattedText
+				inputPhoto.ParseMode = models.ParseModeHTML
+			}
+			media[i] = inputPhoto
+		}
+
+		sentMsgs, mediaErr := h.bot.SendMediaGroup(ctx, &bot.SendMediaGroupParams{
+			ChatID:          topic.GroupID,
+			MessageThreadID: topic.TopicID,
+			Media:           media,
+		})
+		err = mediaErr
+		if len(sentMsgs) > 0 {
+			sentMsg = sentMsgs[0]
+		}
+	}
+
+	if err != nil {
+		log.Printf("Ошибка публикации: %v", err)
+		h.send(ctx, userID, messages.MsgError)
+		// Возвращаем в состояние ожидания контента
+		_ = h.db.UpdateUserState(ctx, userID, database.StateWaitingContent, user.CurrentTopicID)
+		return
+	}
+
+	// Сохраняем пост (проверяем что sentMsg не nil)
+	if sentMsg != nil {
+		expires := time.Now().Add(time.Duration(topic.DurationDays) * 24 * time.Hour)
+		_, _ = h.db.CreatePost(ctx, sentMsg.ID, topic.ID, userID, &content.Text, content.PhotoIDs, expires)
+	}
+
+	// Очищаем контент и сбрасываем состояние
+	h.clearPendingContent(userID)
+	_ = h.db.ResetUser(ctx, userID)
+
+	h.send(ctx, userID, messages.FormatPublished(topic.DurationDays))
+}
+
+// formatPostFromContent форматирует пост из сохранённого контента
+func (h *Handler) formatPostFromContent(userID int64, content *PendingContent) string {
+	// Получаем данные пользователя
+	ctx := context.Background()
+	user, err := h.db.GetUser(ctx, userID)
+	if err != nil {
+		return content.Text
+	}
+
+	name := ""
+	if user.FirstName != nil {
+		name = *user.FirstName
+	}
+	if user.LastName != nil && *user.LastName != "" {
+		name += " " + *user.LastName
+	}
+
+	result := fmt.Sprintf("🛠 <b>Услуга</b>\n\n%s\n\n👤 %s", content.Text, name)
+	if user.Username != nil && *user.Username != "" {
+		result += fmt.Sprintf(" (@%s)", *user.Username)
+	}
+	return result
 }
 
 func (h *Handler) OnPreCheckout(ctx context.Context, b *bot.Bot, update *models.Update) {
@@ -229,7 +446,7 @@ func (h *Handler) onPrivateMessage(ctx context.Context, msg *models.Message) {
 			_ = h.db.UpdateUserState(ctx, userID, database.StateWaitingEmail, &topicID)
 			_, _ = h.bot.SendMessage(ctx, &bot.SendMessageParams{
 				ChatID: userID,
-				Text:   fmt.Sprintf("📧 Укажите email для получения чеков и информационных сообщений.\n"),
+				Text:   "📧 Укажите email для получения чеков и информационных сообщений.\n",
 				ReplyMarkup: &models.InlineKeyboardMarkup{
 					InlineKeyboard: [][]models.InlineKeyboardButton{
 						{{Text: "❌ Пропустить", CallbackData: fmt.Sprintf("skip_email_%d", topic.ID)}},
@@ -317,6 +534,12 @@ func (h *Handler) onPrivateMessage(ctx context.Context, msg *models.Message) {
 		return
 	}
 
+	// Ожидаем подтверждения публикации
+	if user.State == database.StateWaitingConfirm {
+		h.send(ctx, userID, "⚠️ У вас есть неопубликованное объявление.\n\nИспользуйте кнопки выше для подтверждения или отмены.")
+		return
+	}
+
 	// По умолчанию
 	h.send(ctx, userID, messages.MsgPaymentRequired)
 }
@@ -378,29 +601,6 @@ func (h *Handler) onPaymentSuccess(ctx context.Context, msg *models.Message) {
 func (h *Handler) onContentSubmit(ctx context.Context, msg *models.Message, user *database.User) {
 	userID := msg.From.ID
 
-	// Проверка на media group (несколько фото)
-	if msg.MediaGroupID != "" {
-		h.mediaGroupMu.Lock()
-		if h.mediaGroupCache[msg.MediaGroupID] {
-			// Уже обработали первое фото из этой группы — игнорируем остальные
-			h.mediaGroupMu.Unlock()
-			return
-		}
-		h.mediaGroupCache[msg.MediaGroupID] = true
-		h.mediaGroupMu.Unlock()
-
-		// Очистка кэша через 1 минуту
-		go func(groupID string) {
-			time.Sleep(1 * time.Minute)
-			h.mediaGroupMu.Lock()
-			delete(h.mediaGroupCache, groupID)
-			h.mediaGroupMu.Unlock()
-		}(msg.MediaGroupID)
-
-		// Предупреждаем что взяли только первое фото
-		h.send(ctx, userID, "⚠️ Вы отправили несколько фото. Будет использовано только первое.")
-	}
-
 	if user.CurrentTopicID == nil {
 		h.send(ctx, userID, messages.MsgError)
 		return
@@ -412,80 +612,222 @@ func (h *Handler) onContentSubmit(ctx context.Context, msg *models.Message, user
 		return
 	}
 
-	hasContent := msg.Text != "" || msg.Caption != "" || len(msg.Photo) > 0
+	// Получаем текст
+	text := msg.Text
+	if msg.Caption != "" {
+		text = msg.Caption
+	}
+
+	// Получаем фото (берём максимальный размер)
+	var photoID string
+	if len(msg.Photo) > 0 {
+		photoID = msg.Photo[len(msg.Photo)-1].FileID
+	}
+
+	// Если это media group (несколько фото отправленных вместе)
+	if msg.MediaGroupID != "" {
+		h.handleMediaGroup(ctx, msg, user, topic, text, photoID)
+		return
+	}
+
+	// Одиночное сообщение (текст или одно фото)
+	hasContent := text != "" || photoID != ""
 	if !hasContent {
 		h.send(ctx, userID, messages.MsgSendTextOrPhoto)
 		return
 	}
 
 	// Проверка длины текста
-	text := msg.Text
-	if msg.Caption != "" {
-		text = msg.Caption
-	}
 	if len(text) > topic.MaxTextLength {
 		h.send(ctx, userID, fmt.Sprintf("❌ Текст слишком длинный. Максимум %d символов.", topic.MaxTextLength))
 		return
 	}
 
-	// Если модерация включена
-	if topic.ModerationEnabled {
-		var photoIDs []string
-		if len(msg.Photo) > 0 {
-			photoIDs = []string{msg.Photo[len(msg.Photo)-1].FileID}
+	// Сохраняем контент для предпросмотра
+	var photoIDs []string
+	if photoID != "" {
+		photoIDs = []string{photoID}
+	}
+	h.savePendingContent(userID, text, photoIDs)
+
+	// Показываем предпросмотр
+	h.showPreview(ctx, userID, user, topic)
+}
+
+// handleMediaGroup собирает все фото из media group
+func (h *Handler) handleMediaGroup(ctx context.Context, msg *models.Message, user *database.User, topic *database.Topic, text, photoID string) {
+	userID := msg.From.ID
+	groupID := msg.MediaGroupID
+
+	h.mediaGroupMu.Lock()
+	defer h.mediaGroupMu.Unlock()
+
+	// Проверяем, есть ли уже данные для этой группы
+	data, exists := h.mediaGroupCache[groupID]
+	if !exists {
+		// Создаём новую запись
+		data = &MediaGroupData{
+			PhotoIDs:  []string{},
+			UserID:    userID,
+			Processed: false,
 		}
-		_, err := h.db.CreatePendingPost(ctx, userID, topic.ID, &text, photoIDs)
-		if err != nil {
-			h.send(ctx, userID, messages.MsgError)
-			return
-		}
-		_ = h.db.UpdateUserState(ctx, userID, database.StateWaitingModeration, user.CurrentTopicID)
-		h.send(ctx, userID, "⏳ Ваше объявление отправлено на модерацию.")
+		h.mediaGroupCache[groupID] = data
+	}
+
+	// Добавляем фото
+	if photoID != "" {
+		data.PhotoIDs = append(data.PhotoIDs, photoID)
+	}
+
+	// Сохраняем текст (обычно он приходит только с первым фото)
+	if text != "" && data.Text == "" {
+		data.Text = text
+	}
+
+	// Отменяем предыдущий таймер если был
+	if data.Timer != nil {
+		data.Timer.Stop()
+	}
+
+	// Создаём новый таймер - ждём 1.5 секунды после последнего фото
+	data.Timer = time.AfterFunc(1500*time.Millisecond, func() {
+		h.processMediaGroup(groupID, user, topic)
+	})
+}
+
+// processMediaGroup обрабатывает собранную media group
+func (h *Handler) processMediaGroup(groupID string, user *database.User, topic *database.Topic) {
+	h.mediaGroupMu.Lock()
+	data, exists := h.mediaGroupCache[groupID]
+	if !exists || data.Processed {
+		h.mediaGroupMu.Unlock()
+		return
+	}
+	data.Processed = true
+
+	// Копируем данные и удаляем из кэша
+	userID := data.UserID
+	text := data.Text
+	photoIDs := make([]string, len(data.PhotoIDs))
+	copy(photoIDs, data.PhotoIDs)
+
+	// Удаляем из кэша через минуту (для защиты от повторов)
+	go func() {
+		time.Sleep(1 * time.Minute)
+		h.mediaGroupMu.Lock()
+		delete(h.mediaGroupCache, groupID)
+		h.mediaGroupMu.Unlock()
+	}()
+
+	h.mediaGroupMu.Unlock()
+
+	ctx := context.Background()
+
+	// Проверка количества фото
+	if len(photoIDs) > topic.MaxPhotos {
+		h.send(ctx, userID, fmt.Sprintf("⚠️ Вы отправили %d фото, максимум %d. Будут использованы первые %d.",
+			len(photoIDs), topic.MaxPhotos, topic.MaxPhotos))
+		photoIDs = photoIDs[:topic.MaxPhotos]
+	}
+
+	// Проверка длины текста
+	if len(text) > topic.MaxTextLength {
+		h.send(ctx, userID, fmt.Sprintf("❌ Текст слишком длинный. Максимум %d символов.", topic.MaxTextLength))
 		return
 	}
 
-	// Публикуем сразу
-	h.send(ctx, userID, messages.MsgContentAccepted)
+	// Сохраняем контент для предпросмотра
+	h.savePendingContent(userID, text, photoIDs)
 
-	formattedText := h.formatPost(msg)
-	var sentMsg *models.Message
+	// Показываем предпросмотр
+	h.showPreview(ctx, userID, user, topic)
+}
 
-	if len(msg.Photo) > 0 {
-		photo := msg.Photo[len(msg.Photo)-1]
-		sentMsg, err = h.bot.SendPhoto(ctx, &bot.SendPhotoParams{
-			ChatID:          topic.GroupID,
-			MessageThreadID: topic.TopicID,
-			Photo:           &models.InputFileString{Data: photo.FileID},
-			Caption:         formattedText,
-			ParseMode:       models.ParseModeHTML,
-		})
-	} else {
-		sentMsg, err = h.bot.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID:          topic.GroupID,
-			MessageThreadID: topic.TopicID,
-			Text:            formattedText,
-			ParseMode:       models.ParseModeHTML,
-		})
+// savePendingContent сохраняет контент для предпросмотра
+func (h *Handler) savePendingContent(userID int64, text string, photoIDs []string) {
+	h.pendingMu.Lock()
+	defer h.pendingMu.Unlock()
+	h.pendingContent[userID] = &PendingContent{
+		Text:       text,
+		PhotoIDs:   photoIDs,
+		ReceivedAt: time.Now(),
 	}
+}
 
-	if err != nil {
-		log.Printf("Ошибка публикации: %v", err)
+// getPendingContent получает сохранённый контент
+func (h *Handler) getPendingContent(userID int64) *PendingContent {
+	h.pendingMu.Lock()
+	defer h.pendingMu.Unlock()
+	return h.pendingContent[userID]
+}
+
+// clearPendingContent удаляет сохранённый контент
+func (h *Handler) clearPendingContent(userID int64) {
+	h.pendingMu.Lock()
+	defer h.pendingMu.Unlock()
+	delete(h.pendingContent, userID)
+}
+
+// showPreview показывает предпросмотр объявления
+func (h *Handler) showPreview(ctx context.Context, userID int64, user *database.User, topic *database.Topic) {
+	content := h.getPendingContent(userID)
+	if content == nil {
 		h.send(ctx, userID, messages.MsgError)
 		return
 	}
 
-	// Сохраняем пост
-	expires := time.Now().Add(time.Duration(topic.DurationDays) * 24 * time.Hour)
-	var photoIDs []string
-	if len(msg.Photo) > 0 {
-		photoIDs = []string{msg.Photo[len(msg.Photo)-1].FileID}
+	// Обновляем состояние пользователя
+	_ = h.db.UpdateUserState(ctx, userID, database.StateWaitingConfirm, user.CurrentTopicID)
+
+	// Формируем текст предпросмотра
+	previewText := "📋 <b>Предпросмотр объявления:</b>\n\n"
+	previewText += "━━━━━━━━━━━━━━━\n"
+	if content.Text != "" {
+		previewText += content.Text + "\n"
 	}
-	_, _ = h.db.CreatePost(ctx, sentMsg.ID, topic.ID, userID, &text, photoIDs, expires)
+	previewText += "━━━━━━━━━━━━━━━\n\n"
 
-	// Сбрасываем состояние
-	_ = h.db.ResetUser(ctx, userID)
+	if len(content.PhotoIDs) > 0 {
+		previewText += fmt.Sprintf("📷 Фото: %d шт.\n\n", len(content.PhotoIDs))
+	}
 
-	h.send(ctx, userID, messages.FormatPublished(topic.DurationDays))
+	previewText += "Подтвердите публикацию или загрузите заново."
+
+	// Отправляем предпросмотр с кнопками
+	keyboard := &models.InlineKeyboardMarkup{
+		InlineKeyboard: [][]models.InlineKeyboardButton{
+			{
+				{Text: "✅ Опубликовать", CallbackData: "confirm_publish"},
+				{Text: "🔄 Загрузить заново", CallbackData: "reload_content"},
+			},
+		},
+	}
+
+	// Если есть фото - отправляем первое с превью текстом
+	if len(content.PhotoIDs) > 0 {
+		_, err := h.bot.SendPhoto(ctx, &bot.SendPhotoParams{
+			ChatID:      userID,
+			Photo:       &models.InputFileString{Data: content.PhotoIDs[0]},
+			Caption:     previewText,
+			ParseMode:   models.ParseModeHTML,
+			ReplyMarkup: keyboard,
+		})
+		if err != nil {
+			log.Printf("Ошибка отправки предпросмотра: %v", err)
+			h.send(ctx, userID, messages.MsgError)
+		}
+	} else {
+		_, err := h.bot.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID:      userID,
+			Text:        previewText,
+			ParseMode:   models.ParseModeHTML,
+			ReplyMarkup: keyboard,
+		})
+		if err != nil {
+			log.Printf("Ошибка отправки предпросмотра: %v", err)
+			h.send(ctx, userID, messages.MsgError)
+		}
+	}
 }
 
 func (h *Handler) formatPost(msg *models.Message) string {

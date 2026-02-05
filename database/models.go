@@ -9,6 +9,7 @@ const (
 	StateWaitingEmail      UserState = "waiting_email"
 	StateWaitingPayment    UserState = "waiting_payment"
 	StateWaitingContent    UserState = "waiting_content"
+	StateWaitingConfirm    UserState = "waiting_confirm"
 	StateWaitingModeration UserState = "waiting_moderation"
 	StateBanned            UserState = "banned"
 )
