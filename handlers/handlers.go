@@ -7,6 +7,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go_payment_bot/config"
@@ -20,15 +21,23 @@ import (
 )
 
 type Handler struct {
-	bot            *bot.Bot
-	cfg            *config.Config
-	db             *database.DB
-	botUsername    string
-	allowedDomains []string
+	bot             *bot.Bot
+	cfg             *config.Config
+	db              *database.DB
+	botUsername     string
+	allowedDomains  []string
+	mediaGroupCache map[string]bool
+	mediaGroupMu    sync.Mutex
 }
 
 func New(b *bot.Bot, cfg *config.Config, db *database.DB, username string) *Handler {
-	return &Handler{bot: b, cfg: cfg, db: db, botUsername: username}
+	return &Handler{
+		bot:             b,
+		cfg:             cfg,
+		db:              db,
+		botUsername:     username,
+		mediaGroupCache: make(map[string]bool),
+	}
 }
 
 func (h *Handler) OnMessage(ctx context.Context, b *bot.Bot, update *models.Update) {
@@ -80,6 +89,36 @@ func (h *Handler) OnCallback(ctx context.Context, b *bot.Bot, update *models.Upd
 	cb := update.CallbackQuery
 
 	_, _ = b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{CallbackQueryID: cb.ID})
+
+	// Формат: skip_email_<topic_id>
+	if strings.HasPrefix(cb.Data, "skip_email_") {
+		topicIDStr := strings.TrimPrefix(cb.Data, "skip_email_")
+		topicID, err := strconv.Atoi(topicIDStr)
+		if err != nil {
+			return
+		}
+
+		// Отмечаем что отказался от email
+		_ = h.db.SetUserEmailDeclined(ctx, cb.From.ID)
+		_ = h.db.UpdateUserState(ctx, cb.From.ID, database.StateNone, &topicID)
+
+		topic, err := h.db.GetTopicByID(ctx, topicID)
+		if err != nil {
+			return
+		}
+
+		// Показываем кнопку оплаты
+		_, _ = h.bot.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: cb.From.ID,
+			Text:   messages.FormatWelcome(topic.Price, topic.DurationDays),
+			ReplyMarkup: &models.InlineKeyboardMarkup{
+				InlineKeyboard: [][]models.InlineKeyboardButton{{
+					{Text: "💳 Оплатить", CallbackData: fmt.Sprintf("pay_%d", topic.ID)},
+				}},
+			},
+		})
+		return
+	}
 
 	// Формат: pay_<topic_id>
 	if strings.HasPrefix(cb.Data, "pay_") {
@@ -181,6 +220,27 @@ func (h *Handler) onPrivateMessage(ctx context.Context, msg *models.Message) {
 			return
 		}
 
+		// Сохраняем выбранную тему
+		_ = h.db.UpdateUserState(ctx, userID, database.StateNone, &topicID)
+
+		// Проверяем, нужно ли спрашивать email
+		if user.Email == nil && !user.EmailDeclined {
+			// Спрашиваем email
+			_ = h.db.UpdateUserState(ctx, userID, database.StateWaitingEmail, &topicID)
+			_, _ = h.bot.SendMessage(ctx, &bot.SendMessageParams{
+				ChatID: userID,
+				Text: fmt.Sprintf("📧 Укажите email для получения чеков и информационных сообщений.\n\n💰 Стоимость размещения: %d ₽ на %d дней",
+					topic.Price/100, topic.DurationDays),
+				ReplyMarkup: &models.InlineKeyboardMarkup{
+					InlineKeyboard: [][]models.InlineKeyboardButton{
+						{{Text: "❌ Пропустить", CallbackData: fmt.Sprintf("skip_email_%d", topic.ID)}},
+					},
+				},
+			})
+			return
+		}
+
+		// Email уже есть или отказались — сразу к оплате
 		text := messages.FormatWelcome(topic.Price, topic.DurationDays)
 		_, _ = h.bot.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID: userID,
@@ -213,6 +273,37 @@ func (h *Handler) onPrivateMessage(ctx context.Context, msg *models.Message) {
 		_ = h.db.MarkUserPaid(ctx, userID, topic.ID)
 		_, _ = h.db.CreatePayment(ctx, userID, topic.ID, "test_payment", topic.Price, "RUB")
 		h.send(ctx, userID, messages.FormatPaymentSuccess(topic.MaxPhotos))
+		return
+	}
+
+	// Ожидаем email
+	if user.State == database.StateWaitingEmail {
+		email := strings.TrimSpace(msg.Text)
+		if !isValidEmail(email) {
+			h.send(ctx, userID, "❌ Неверный формат email. Попробуйте ещё раз или нажмите «Пропустить».")
+			return
+		}
+
+		// Сохраняем email
+		_ = h.db.SetUserEmail(ctx, userID, email)
+		h.send(ctx, userID, fmt.Sprintf("✅ Email %s сохранён!", email))
+
+		// Показываем кнопку оплаты
+		if user.CurrentTopicID != nil {
+			topic, err := h.db.GetTopicByID(ctx, *user.CurrentTopicID)
+			if err == nil {
+				_ = h.db.UpdateUserState(ctx, userID, database.StateNone, user.CurrentTopicID)
+				_, _ = h.bot.SendMessage(ctx, &bot.SendMessageParams{
+					ChatID: userID,
+					Text:   messages.FormatWelcome(topic.Price, topic.DurationDays),
+					ReplyMarkup: &models.InlineKeyboardMarkup{
+						InlineKeyboard: [][]models.InlineKeyboardButton{{
+							{Text: "💳 Оплатить", CallbackData: fmt.Sprintf("pay_%d", topic.ID)},
+						}},
+					},
+				})
+			}
+		}
 		return
 	}
 
@@ -287,6 +378,29 @@ func (h *Handler) onPaymentSuccess(ctx context.Context, msg *models.Message) {
 
 func (h *Handler) onContentSubmit(ctx context.Context, msg *models.Message, user *database.User) {
 	userID := msg.From.ID
+
+	// Проверка на media group (несколько фото)
+	if msg.MediaGroupID != "" {
+		h.mediaGroupMu.Lock()
+		if h.mediaGroupCache[msg.MediaGroupID] {
+			// Уже обработали первое фото из этой группы — игнорируем остальные
+			h.mediaGroupMu.Unlock()
+			return
+		}
+		h.mediaGroupCache[msg.MediaGroupID] = true
+		h.mediaGroupMu.Unlock()
+
+		// Очистка кэша через 1 минуту
+		go func(groupID string) {
+			time.Sleep(1 * time.Minute)
+			h.mediaGroupMu.Lock()
+			delete(h.mediaGroupCache, groupID)
+			h.mediaGroupMu.Unlock()
+		}(msg.MediaGroupID)
+
+		// Предупреждаем что взяли только первое фото
+		h.send(ctx, userID, "⚠️ Вы отправили несколько фото. Будет использовано только первое.")
+	}
 
 	if user.CurrentTopicID == nil {
 		h.send(ctx, userID, messages.MsgError)
@@ -484,6 +598,16 @@ func ptrStr(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// Валидация email
+func isValidEmail(email string) bool {
+	if len(email) < 5 || len(email) > 254 {
+		return false
+	}
+	at := strings.Index(email, "@")
+	dot := strings.LastIndex(email, ".")
+	return at > 0 && dot > at+1 && dot < len(email)-1
 }
 
 // Для проверки ошибки "not found"

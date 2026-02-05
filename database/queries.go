@@ -85,12 +85,12 @@ func (db *DB) GetOrCreateUser(ctx context.Context, id int64, username, firstName
 			username = COALESCE(EXCLUDED.username, users.username),
 			first_name = COALESCE(EXCLUDED.first_name, users.first_name),
 			last_name = COALESCE(EXCLUDED.last_name, users.last_name)
-		RETURNING id, username, first_name, last_name, state, current_topic_id, 
+		RETURNING id, username, first_name, last_name, email, email_declined, state, current_topic_id, 
 		          paid_at, banned_at, ban_reason, created_at`
 
 	var u User
 	err := db.Pool.QueryRow(ctx, query, id, username, firstName, lastName).Scan(
-		&u.ID, &u.Username, &u.FirstName, &u.LastName, &u.State, &u.CurrentTopicID,
+		&u.ID, &u.Username, &u.FirstName, &u.LastName, &u.Email, &u.EmailDeclined, &u.State, &u.CurrentTopicID,
 		&u.PaidAt, &u.BannedAt, &u.BanReason, &u.CreatedAt,
 	)
 	return &u, err
@@ -98,14 +98,14 @@ func (db *DB) GetOrCreateUser(ctx context.Context, id int64, username, firstName
 
 func (db *DB) GetUser(ctx context.Context, id int64) (*User, error) {
 	query := `
-		SELECT id, username, first_name, last_name, state, current_topic_id, 
+		SELECT id, username, first_name, last_name, email, email_declined, state, current_topic_id, 
 		       paid_at, banned_at, ban_reason, created_at
 		FROM users
 		WHERE id = $1`
 
 	var u User
 	err := db.Pool.QueryRow(ctx, query, id).Scan(
-		&u.ID, &u.Username, &u.FirstName, &u.LastName, &u.State, &u.CurrentTopicID,
+		&u.ID, &u.Username, &u.FirstName, &u.LastName, &u.Email, &u.EmailDeclined, &u.State, &u.CurrentTopicID,
 		&u.PaidAt, &u.BannedAt, &u.BanReason, &u.CreatedAt,
 	)
 	return &u, err
@@ -132,6 +132,18 @@ func (db *DB) ResetUser(ctx context.Context, userID int64) error {
 func (db *DB) BanUser(ctx context.Context, userID int64, reason string) error {
 	query := `UPDATE users SET state = 'banned', banned_at = NOW(), ban_reason = $1 WHERE id = $2`
 	_, err := db.Pool.Exec(ctx, query, reason, userID)
+	return err
+}
+
+func (db *DB) SetUserEmail(ctx context.Context, userID int64, email string) error {
+	query := `UPDATE users SET email = $1 WHERE id = $2`
+	_, err := db.Pool.Exec(ctx, query, email, userID)
+	return err
+}
+
+func (db *DB) SetUserEmailDeclined(ctx context.Context, userID int64) error {
+	query := `UPDATE users SET email_declined = TRUE WHERE id = $1`
+	_, err := db.Pool.Exec(ctx, query, userID)
 	return err
 }
 
