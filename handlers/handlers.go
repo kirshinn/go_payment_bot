@@ -229,8 +229,7 @@ func (h *Handler) onPrivateMessage(ctx context.Context, msg *models.Message) {
 			_ = h.db.UpdateUserState(ctx, userID, database.StateWaitingEmail, &topicID)
 			_, _ = h.bot.SendMessage(ctx, &bot.SendMessageParams{
 				ChatID: userID,
-				Text: fmt.Sprintf("📧 Укажите email для получения чеков и информационных сообщений.\n\n💰 Стоимость размещения: %d ₽ на %d дней",
-					topic.Price/100, topic.DurationDays),
+				Text:   fmt.Sprintf("📧 Укажите email для получения чеков и информационных сообщений.\n"),
 				ReplyMarkup: &models.InlineKeyboardMarkup{
 					InlineKeyboard: [][]models.InlineKeyboardButton{
 						{{Text: "❌ Пропустить", CallbackData: fmt.Sprintf("skip_email_%d", topic.ID)}},
@@ -319,7 +318,7 @@ func (h *Handler) onPrivateMessage(ctx context.Context, msg *models.Message) {
 	}
 
 	// По умолчанию
-	h.send(ctx, userID, "💳 Для размещения объявления напишите в тему группы и оплатите размещение.")
+	h.send(ctx, userID, messages.MsgPaymentRequired)
 }
 
 func (h *Handler) sendInvoice(ctx context.Context, userID int64, topicID int) {
@@ -557,13 +556,8 @@ func (h *Handler) handleSpamViolation(ctx context.Context, msg *models.Message, 
 	warning, err := h.bot.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID:          msg.Chat.ID,
 		MessageThreadID: msg.MessageThreadID,
-		Text: fmt.Sprintf(`<a href="tg://user?id=%d">%s</a>, ваше сообщение удалено.
-
-⚠️ Публикация номеров телефонов, личных контактов и коротких ссылок запрещена.
-
-Коммерческие объявления — только в разделе «Услуги».`,
-			msg.From.ID, msg.From.FirstName),
-		ParseMode: models.ParseModeHTML,
+		Text:            messages.FormatSpamWarning(msg.From.ID, msg.From.FirstName),
+		ParseMode:       models.ParseModeHTML,
 	})
 	if err != nil {
 		log.Printf("Ошибка отправки предупреждения: %v", err)
