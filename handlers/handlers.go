@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,14 +23,21 @@ import (
 
 // PendingContent хранит контент объявления до подтверждения
 type PendingContent struct {
-	Text       string
-	PhotoIDs   []string
-	ReceivedAt time.Time
+	Text              string
+	PhotoIDs          []string
+	ReceivedAt        time.Time
+	PreviewMessageIDs []int
+}
+
+// mediaGroupPhoto хранит фото с ID сообщения для сортировки
+type mediaGroupPhoto struct {
+	MessageID int
+	PhotoID   string
 }
 
 // MediaGroupData хранит данные о фото из media group
 type MediaGroupData struct {
-	PhotoIDs  []string
+	Photos    []mediaGroupPhoto
 	Text      string
 	UserID    int64
 	Timer     *time.Timer
@@ -177,8 +185,9 @@ func (h *Handler) deleteCallbackMessage(ctx context.Context, cb *models.Callback
 func (h *Handler) handleConfirmPublish(ctx context.Context, cb *models.CallbackQuery) {
 	userID := cb.From.ID
 
-	// Удаляем сообщение с кнопками
+	// Удаляем сообщение с кнопками и фото превью
 	h.deleteCallbackMessage(ctx, cb)
+	h.deletePreviewMessages(ctx, userID)
 
 	// Получаем пользователя
 	user, err := h.db.GetUser(ctx, userID)
@@ -229,8 +238,9 @@ func (h *Handler) handleConfirmPublish(ctx context.Context, cb *models.CallbackQ
 func (h *Handler) handleReloadContent(ctx context.Context, cb *models.CallbackQuery) {
 	userID := cb.From.ID
 
-	// Удаляем сообщение с кнопками
+	// Удаляем сообщение с кнопками и фото превью
 	h.deleteCallbackMessage(ctx, cb)
+	h.deletePreviewMessages(ctx, userID)
 
 	// Получаем пользователя
 	user, err := h.db.GetUser(ctx, userID)
@@ -556,13 +566,13 @@ func (h *Handler) sendInvoice(ctx context.Context, userID int64, topicID int) {
 
 	_, err = h.bot.SendInvoice(ctx, &bot.SendInvoiceParams{
 		ChatID:        userID,
-		Title:         "Размещение объявления",
+		Title:         "размещение объявления",
 		Description:   fmt.Sprintf("Публикация на %d дней в теме «%s»", topic.DurationDays, topic.Title),
 		Payload:       fmt.Sprintf("topic_%d_user_%d_%d", topicID, userID, time.Now().Unix()),
 		ProviderToken: h.cfg.PaymentProviderToken,
 		Currency:      "RUB",
 		Prices: []models.LabeledPrice{{
-			Label:  "Размещение",
+			Label:  "размещение",
 			Amount: topic.Price,
 		}},
 	})
@@ -667,16 +677,19 @@ func (h *Handler) handleMediaGroup(ctx context.Context, msg *models.Message, use
 	if !exists {
 		// Создаём новую запись
 		data = &MediaGroupData{
-			PhotoIDs:  []string{},
+			Photos:    []mediaGroupPhoto{},
 			UserID:    userID,
 			Processed: false,
 		}
 		h.mediaGroupCache[groupID] = data
 	}
 
-	// Добавляем фото
+	// Добавляем фото с ID сообщения для сортировки
 	if photoID != "" {
-		data.PhotoIDs = append(data.PhotoIDs, photoID)
+		data.Photos = append(data.Photos, mediaGroupPhoto{
+			MessageID: msg.ID,
+			PhotoID:   photoID,
+		})
 	}
 
 	// Сохраняем текст (обычно он приходит только с первым фото)
@@ -705,11 +718,22 @@ func (h *Handler) processMediaGroup(groupID string, user *database.User, topic *
 	}
 	data.Processed = true
 
-	// Копируем данные и удаляем из кэша
+	// Копируем данные и сортируем фото по message_id
 	userID := data.UserID
 	text := data.Text
-	photoIDs := make([]string, len(data.PhotoIDs))
-	copy(photoIDs, data.PhotoIDs)
+	photos := make([]mediaGroupPhoto, len(data.Photos))
+	copy(photos, data.Photos)
+
+	// Сортируем по message_id для правильного порядка
+	sort.Slice(photos, func(i, j int) bool {
+		return photos[i].MessageID < photos[j].MessageID
+	})
+
+	// Извлекаем отсортированные photoIDs
+	photoIDs := make([]string, len(photos))
+	for i, p := range photos {
+		photoIDs[i] = p.PhotoID
+	}
 
 	// Удаляем из кэша через минуту (для защиты от повторов)
 	go func() {
@@ -768,6 +792,29 @@ func (h *Handler) clearPendingContent(userID int64) {
 	delete(h.pendingContent, userID)
 }
 
+// setPreviewMessageIDs сохраняет ID сообщений превью для последующего удаления
+func (h *Handler) setPreviewMessageIDs(userID int64, msgIDs []int) {
+	h.pendingMu.Lock()
+	defer h.pendingMu.Unlock()
+	if content, ok := h.pendingContent[userID]; ok {
+		content.PreviewMessageIDs = msgIDs
+	}
+}
+
+// deletePreviewMessages удаляет сообщения media group из превью
+func (h *Handler) deletePreviewMessages(ctx context.Context, userID int64) {
+	content := h.getPendingContent(userID)
+	if content == nil {
+		return
+	}
+	for _, msgID := range content.PreviewMessageIDs {
+		_, _ = h.bot.DeleteMessage(ctx, &bot.DeleteMessageParams{
+			ChatID:    userID,
+			MessageID: msgID,
+		})
+	}
+}
+
 // showPreview показывает предпросмотр объявления
 func (h *Handler) showPreview(ctx context.Context, userID int64, user *database.User, topic *database.Topic) {
 	content := h.getPendingContent(userID)
@@ -803,8 +850,43 @@ func (h *Handler) showPreview(ctx context.Context, userID int64, user *database.
 		},
 	}
 
-	// Если есть фото - отправляем первое с превью текстом
-	if len(content.PhotoIDs) > 0 {
+	if len(content.PhotoIDs) > 1 {
+		// Несколько фото — отправляем media group, затем текст с кнопками
+		media := make([]models.InputMedia, len(content.PhotoIDs))
+		for i, photoID := range content.PhotoIDs {
+			media[i] = &models.InputMediaPhoto{Media: photoID}
+		}
+
+		sentMsgs, err := h.bot.SendMediaGroup(ctx, &bot.SendMediaGroupParams{
+			ChatID: userID,
+			Media:  media,
+		})
+		if err != nil {
+			log.Printf("Ошибка отправки фото предпросмотра: %v", err)
+			h.send(ctx, userID, messages.MsgError)
+			return
+		}
+
+		// Сохраняем ID сообщений media group для удаления при confirm/reload
+		var msgIDs []int
+		for _, m := range sentMsgs {
+			msgIDs = append(msgIDs, m.ID)
+		}
+		h.setPreviewMessageIDs(userID, msgIDs)
+
+		// Отдельное сообщение с текстом и кнопками
+		_, err = h.bot.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID:      userID,
+			Text:        previewText,
+			ParseMode:   models.ParseModeHTML,
+			ReplyMarkup: keyboard,
+		})
+		if err != nil {
+			log.Printf("Ошибка отправки предпросмотра: %v", err)
+			h.send(ctx, userID, messages.MsgError)
+		}
+	} else if len(content.PhotoIDs) == 1 {
+		// Одно фото — отправляем с подписью и кнопками
 		_, err := h.bot.SendPhoto(ctx, &bot.SendPhotoParams{
 			ChatID:      userID,
 			Photo:       &models.InputFileString{Data: content.PhotoIDs[0]},
@@ -817,6 +899,7 @@ func (h *Handler) showPreview(ctx context.Context, userID int64, user *database.
 			h.send(ctx, userID, messages.MsgError)
 		}
 	} else {
+		// Без фото — только текст с кнопками
 		_, err := h.bot.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID:      userID,
 			Text:        previewText,
