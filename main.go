@@ -17,9 +17,7 @@ import (
 )
 
 func main() {
-	if err := godotenv.Load(); err != nil {
-		log.Println("Файл .env не найден, используем переменные окружения")
-	}
+	_ = godotenv.Load()
 
 	cfg := config.Load()
 
