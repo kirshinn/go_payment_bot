@@ -1,10 +1,12 @@
--- Схема БД: services_bot
+-- Схема БД: go_payment_bot
 -- PostgreSQL 17
 
 CREATE TYPE user_state AS ENUM (
     'none',
+    'waiting_email',
     'waiting_payment',
     'waiting_content',
+    'waiting_confirm',
     'waiting_moderation',
     'banned'
 );
@@ -36,9 +38,12 @@ CREATE TABLE users (
     username VARCHAR(255),
     first_name VARCHAR(255),
     last_name VARCHAR(255),
+    email VARCHAR(255),
+    email_declined BOOLEAN NOT NULL DEFAULT FALSE,
     state user_state NOT NULL DEFAULT 'none',
     current_topic_id INTEGER REFERENCES topics(id),
     paid_at TIMESTAMPTZ,
+    receipt_sent_at TIMESTAMPTZ,
     banned_at TIMESTAMPTZ,
     ban_reason TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW()

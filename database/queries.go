@@ -85,12 +85,12 @@ func (db *DB) GetOrCreateUser(ctx context.Context, id int64, username, firstName
 			username = COALESCE(EXCLUDED.username, users.username),
 			first_name = COALESCE(EXCLUDED.first_name, users.first_name),
 			last_name = COALESCE(EXCLUDED.last_name, users.last_name)
-		RETURNING id, username, first_name, last_name, state, current_topic_id, 
+		RETURNING id, username, first_name, last_name, email, email_declined, state, current_topic_id, 
 		          paid_at, banned_at, ban_reason, created_at`
 
 	var u User
 	err := db.Pool.QueryRow(ctx, query, id, username, firstName, lastName).Scan(
-		&u.ID, &u.Username, &u.FirstName, &u.LastName, &u.State, &u.CurrentTopicID,
+		&u.ID, &u.Username, &u.FirstName, &u.LastName, &u.Email, &u.EmailDeclined, &u.State, &u.CurrentTopicID,
 		&u.PaidAt, &u.BannedAt, &u.BanReason, &u.CreatedAt,
 	)
 	return &u, err
@@ -98,14 +98,14 @@ func (db *DB) GetOrCreateUser(ctx context.Context, id int64, username, firstName
 
 func (db *DB) GetUser(ctx context.Context, id int64) (*User, error) {
 	query := `
-		SELECT id, username, first_name, last_name, state, current_topic_id, 
+		SELECT id, username, first_name, last_name, email, email_declined, state, current_topic_id, 
 		       paid_at, banned_at, ban_reason, created_at
 		FROM users
 		WHERE id = $1`
 
 	var u User
 	err := db.Pool.QueryRow(ctx, query, id).Scan(
-		&u.ID, &u.Username, &u.FirstName, &u.LastName, &u.State, &u.CurrentTopicID,
+		&u.ID, &u.Username, &u.FirstName, &u.LastName, &u.Email, &u.EmailDeclined, &u.State, &u.CurrentTopicID,
 		&u.PaidAt, &u.BannedAt, &u.BanReason, &u.CreatedAt,
 	)
 	return &u, err
@@ -132,6 +132,18 @@ func (db *DB) ResetUser(ctx context.Context, userID int64) error {
 func (db *DB) BanUser(ctx context.Context, userID int64, reason string) error {
 	query := `UPDATE users SET state = 'banned', banned_at = NOW(), ban_reason = $1 WHERE id = $2`
 	_, err := db.Pool.Exec(ctx, query, reason, userID)
+	return err
+}
+
+func (db *DB) SetUserEmail(ctx context.Context, userID int64, email string) error {
+	query := `UPDATE users SET email = $1 WHERE id = $2`
+	_, err := db.Pool.Exec(ctx, query, email, userID)
+	return err
+}
+
+func (db *DB) SetUserEmailDeclined(ctx context.Context, userID int64) error {
+	query := `UPDATE users SET email_declined = TRUE WHERE id = $1`
+	_, err := db.Pool.Exec(ctx, query, userID)
 	return err
 }
 
@@ -176,16 +188,16 @@ func (db *DB) DeletePendingPost(ctx context.Context, id int) error {
 // Posts
 // ============================================
 
-func (db *DB) CreatePost(ctx context.Context, messageID int, topicID int, userID int64, text *string, photoIDs []string, expiresAt time.Time) (*Post, error) {
+func (db *DB) CreatePost(ctx context.Context, messageID int, allMessageIDs []int, topicID int, userID int64, text *string, photoIDs []string, expiresAt time.Time) (*Post, error) {
 	query := `
-		INSERT INTO posts (message_id, topic_id, user_id, content_text, photo_file_ids, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id, message_id, topic_id, user_id, content_text, photo_file_ids, 
+		INSERT INTO posts (message_id, all_message_ids, topic_id, user_id, content_text, photo_file_ids, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id, message_id, all_message_ids, topic_id, user_id, content_text, photo_file_ids, 
 		          created_at, expires_at, is_deleted, deleted_at`
 
 	var p Post
-	err := db.Pool.QueryRow(ctx, query, messageID, topicID, userID, text, photoIDs, expiresAt).Scan(
-		&p.ID, &p.MessageID, &p.TopicID, &p.UserID, &p.ContentText, &p.PhotoFileIDs,
+	err := db.Pool.QueryRow(ctx, query, messageID, allMessageIDs, topicID, userID, text, photoIDs, expiresAt).Scan(
+		&p.ID, &p.MessageID, &p.AllMessageIDs, &p.TopicID, &p.UserID, &p.ContentText, &p.PhotoFileIDs,
 		&p.CreatedAt, &p.ExpiresAt, &p.IsDeleted, &p.DeletedAt,
 	)
 	return &p, err
@@ -193,7 +205,7 @@ func (db *DB) CreatePost(ctx context.Context, messageID int, topicID int, userID
 
 func (db *DB) GetExpiredPosts(ctx context.Context) ([]ExpiredPost, error) {
 	query := `
-		SELECT p.id, p.message_id, t.group_id, t.topic_id, p.user_id, p.expires_at
+		SELECT p.id, p.message_id, p.all_message_ids, t.group_id, t.topic_id, t.id, p.user_id, p.expires_at
 		FROM posts p
 		JOIN topics t ON t.id = p.topic_id
 		WHERE p.is_deleted = FALSE AND p.expires_at < NOW()`
@@ -207,7 +219,7 @@ func (db *DB) GetExpiredPosts(ctx context.Context) ([]ExpiredPost, error) {
 	var posts []ExpiredPost
 	for rows.Next() {
 		var p ExpiredPost
-		if err := rows.Scan(&p.ID, &p.MessageID, &p.ChatID, &p.TopicID, &p.UserID, &p.ExpiresAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.MessageID, &p.AllMessageIDs, &p.ChatID, &p.TopicID, &p.InternalTopicID, &p.UserID, &p.ExpiresAt); err != nil {
 			return nil, err
 		}
 		posts = append(posts, p)
@@ -236,4 +248,58 @@ func (db *DB) CreatePayment(ctx context.Context, userID int64, topicID int, tele
 		&p.ID, &p.UserID, &p.TopicID, &p.TelegramPaymentID, &p.Amount, &p.Currency, &p.CreatedAt,
 	)
 	return &p, err
+}
+
+// ============================================
+// Spam Violations
+// ============================================
+
+func (db *DB) CreateSpamViolation(ctx context.Context, userID, groupID int64, topicID *int, messageText, violationType, matchFound string) error {
+	query := `
+		INSERT INTO spam_violations (user_id, group_id, topic_id, message_text, violation_type, match_found)
+		VALUES ($1, $2, $3, $4, $5, $6)`
+	_, err := db.Pool.Exec(ctx, query, userID, groupID, topicID, messageText, violationType, matchFound)
+	return err
+}
+
+func (db *DB) GetUserViolationsCount(ctx context.Context, userID int64, since time.Time) (int, error) {
+	query := `SELECT COUNT(*) FROM spam_violations WHERE user_id = $1 AND created_at > $2`
+	var count int
+	err := db.Pool.QueryRow(ctx, query, userID, since).Scan(&count)
+	return count, err
+}
+
+// ============================================
+// Allowed Domains
+// ============================================
+
+func (db *DB) GetAllowedDomains(ctx context.Context) ([]string, error) {
+	query := `SELECT domain FROM allowed_domains WHERE is_active = TRUE`
+	rows, err := db.Pool.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var domains []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return nil, err
+		}
+		domains = append(domains, d)
+	}
+	return domains, rows.Err()
+}
+
+func (db *DB) AddAllowedDomain(ctx context.Context, domain, description string) error {
+	query := `INSERT INTO allowed_domains (domain, description) VALUES ($1, $2) ON CONFLICT (domain) DO NOTHING`
+	_, err := db.Pool.Exec(ctx, query, domain, description)
+	return err
+}
+
+func (db *DB) RemoveAllowedDomain(ctx context.Context, domain string) error {
+	query := `UPDATE allowed_domains SET is_active = FALSE WHERE domain = $1`
+	_, err := db.Pool.Exec(ctx, query, domain)
+	return err
 }

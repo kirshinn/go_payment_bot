@@ -2,7 +2,8 @@ services:
   bot:
     build: .
     restart: unless-stopped
+    network_mode: host
     env_file:
       - .env
     environment:
-      - TZ=Europe/Moscow
+      - TZ=Asia/Krasnoyarsk

@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"go_payment_bot/config"
+	"go_payment_bot/database"
 	"go_payment_bot/handlers"
-	"go_payment_bot/storage"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -17,20 +17,27 @@ import (
 )
 
 func main() {
-	err := godotenv.Load()
-	if err != nil {
-		return
-	}
+	_ = godotenv.Load()
+
 	cfg := config.Load()
 
 	if cfg.BotToken == "" {
 		log.Fatal("BOT_TOKEN не установлен")
 	}
+	if cfg.DatabaseURL == "" {
+		log.Fatal("DATABASE_URL не установлен")
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	store := storage.New()
+	// Подключение к БД
+	db, err := database.New(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Fatalf("Ошибка подключения к БД: %v", err)
+	}
+	defer db.Close()
+	log.Println("Подключено к БД")
 
 	opts := []bot.Option{
 		bot.WithDefaultHandler(func(ctx context.Context, b *bot.Bot, update *models.Update) {}),
@@ -49,7 +56,24 @@ func main() {
 	botUsername := me.Username
 	log.Printf("Бот @%s запущен", botUsername)
 
-	h := handlers.New(b, cfg, store, botUsername)
+	h := handlers.New(b, cfg, db, botUsername)
+
+	// Загружаем разрешённые домены
+	h.LoadAllowedDomains(ctx)
+
+	// Перезагрузка каждый час (опционально)
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				h.LoadAllowedDomains(context.Background())
+			}
+		}
+	}()
 
 	b.RegisterHandler(bot.HandlerTypeMessageText, "", bot.MatchTypePrefix, h.OnMessage)
 	b.RegisterHandler(bot.HandlerTypeCallbackQueryData, "", bot.MatchTypePrefix, h.OnCallback)
@@ -66,8 +90,9 @@ func main() {
 		return update.PreCheckoutQuery != nil
 	}, h.OnPreCheckout)
 
+	// Проверка просроченных постов каждые 5 минут
 	go func() {
-		ticker := time.NewTicker(time.Hour)
+		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 		for {
 			select {
