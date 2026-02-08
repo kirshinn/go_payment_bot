@@ -38,6 +38,10 @@ const (
 • Контакты
 
 ⚠️ Одним сообщением.`
+
+	MsgExpiredReminder = `⏰ Срок вашего объявления в теме «%s» истёк и оно удалено.
+
+Хотите разместить заново? 💰 %d ₽ за %d дней.`
 )
 
 func FormatDeleted(price, days int) string {
@@ -66,4 +70,8 @@ func FormatSpamWarning(userID int64, firstName string) string {
 
 func FormatReloadContent(maxPhotos int) string {
 	return fmt.Sprintf(MsgReloadContent, maxPhotos)
+}
+
+func FormatExpiredReminder(topicTitle string, price, days int) string {
+	return fmt.Sprintf(MsgExpiredReminder, topicTitle, price/100, days)
 }

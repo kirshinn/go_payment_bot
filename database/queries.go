@@ -188,16 +188,16 @@ func (db *DB) DeletePendingPost(ctx context.Context, id int) error {
 // Posts
 // ============================================
 
-func (db *DB) CreatePost(ctx context.Context, messageID int, topicID int, userID int64, text *string, photoIDs []string, expiresAt time.Time) (*Post, error) {
+func (db *DB) CreatePost(ctx context.Context, messageID int, allMessageIDs []int, topicID int, userID int64, text *string, photoIDs []string, expiresAt time.Time) (*Post, error) {
 	query := `
-		INSERT INTO posts (message_id, topic_id, user_id, content_text, photo_file_ids, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id, message_id, topic_id, user_id, content_text, photo_file_ids, 
+		INSERT INTO posts (message_id, all_message_ids, topic_id, user_id, content_text, photo_file_ids, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id, message_id, all_message_ids, topic_id, user_id, content_text, photo_file_ids, 
 		          created_at, expires_at, is_deleted, deleted_at`
 
 	var p Post
-	err := db.Pool.QueryRow(ctx, query, messageID, topicID, userID, text, photoIDs, expiresAt).Scan(
-		&p.ID, &p.MessageID, &p.TopicID, &p.UserID, &p.ContentText, &p.PhotoFileIDs,
+	err := db.Pool.QueryRow(ctx, query, messageID, allMessageIDs, topicID, userID, text, photoIDs, expiresAt).Scan(
+		&p.ID, &p.MessageID, &p.AllMessageIDs, &p.TopicID, &p.UserID, &p.ContentText, &p.PhotoFileIDs,
 		&p.CreatedAt, &p.ExpiresAt, &p.IsDeleted, &p.DeletedAt,
 	)
 	return &p, err
@@ -205,7 +205,7 @@ func (db *DB) CreatePost(ctx context.Context, messageID int, topicID int, userID
 
 func (db *DB) GetExpiredPosts(ctx context.Context) ([]ExpiredPost, error) {
 	query := `
-		SELECT p.id, p.message_id, t.group_id, t.topic_id, p.user_id, p.expires_at
+		SELECT p.id, p.message_id, p.all_message_ids, t.group_id, t.topic_id, t.id, p.user_id, p.expires_at
 		FROM posts p
 		JOIN topics t ON t.id = p.topic_id
 		WHERE p.is_deleted = FALSE AND p.expires_at < NOW()`
@@ -219,7 +219,7 @@ func (db *DB) GetExpiredPosts(ctx context.Context) ([]ExpiredPost, error) {
 	var posts []ExpiredPost
 	for rows.Next() {
 		var p ExpiredPost
-		if err := rows.Scan(&p.ID, &p.MessageID, &p.ChatID, &p.TopicID, &p.UserID, &p.ExpiresAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.MessageID, &p.AllMessageIDs, &p.ChatID, &p.TopicID, &p.InternalTopicID, &p.UserID, &p.ExpiresAt); err != nil {
 			return nil, err
 		}
 		posts = append(posts, p)

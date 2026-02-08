@@ -62,16 +62,17 @@ type PendingPost struct {
 }
 
 type Post struct {
-	ID           int
-	MessageID    int
-	TopicID      int
-	UserID       int64
-	ContentText  *string
-	PhotoFileIDs []string
-	CreatedAt    time.Time
-	ExpiresAt    time.Time
-	IsDeleted    bool
-	DeletedAt    *time.Time
+	ID            int
+	MessageID     int
+	AllMessageIDs []int
+	TopicID       int
+	UserID        int64
+	ContentText   *string
+	PhotoFileIDs  []string
+	CreatedAt     time.Time
+	ExpiresAt     time.Time
+	IsDeleted     bool
+	DeletedAt     *time.Time
 }
 
 type Payment struct {
@@ -86,12 +87,14 @@ type Payment struct {
 
 // ExpiredPost — для удаления просроченных
 type ExpiredPost struct {
-	ID        int
-	MessageID int
-	ChatID    int64
-	TopicID   int
-	UserID    int64
-	ExpiresAt time.Time
+	ID              int
+	MessageID       int
+	AllMessageIDs   []int
+	ChatID          int64
+	TopicID         int
+	InternalTopicID int
+	UserID          int64
+	ExpiresAt       time.Time
 }
 
 type SpamViolation struct {

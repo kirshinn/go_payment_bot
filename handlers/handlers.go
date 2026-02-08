@@ -26,7 +26,7 @@ type PendingContent struct {
 	Text              string
 	PhotoIDs          []string
 	ReceivedAt        time.Time
-	PreviewMessageIDs []int
+	PreviewMessageIDs []int // ID сообщений media group для удаления при confirm/reload
 }
 
 // mediaGroupPhoto хранит фото с ID сообщения для сортировки
@@ -268,6 +268,7 @@ func (h *Handler) handleReloadContent(ctx context.Context, cb *models.CallbackQu
 func (h *Handler) publishPost(ctx context.Context, userID int64, user *database.User, topic *database.Topic, content *PendingContent) {
 	formattedText := h.formatPostFromContent(userID, content)
 	var sentMsg *models.Message
+	var allMessageIDs []int
 	var err error
 
 	if len(content.PhotoIDs) == 0 {
@@ -278,6 +279,9 @@ func (h *Handler) publishPost(ctx context.Context, userID int64, user *database.
 			Text:            formattedText,
 			ParseMode:       models.ParseModeHTML,
 		})
+		if sentMsg != nil {
+			allMessageIDs = []int{sentMsg.ID}
+		}
 	} else if len(content.PhotoIDs) == 1 {
 		// Одно фото
 		sentMsg, err = h.bot.SendPhoto(ctx, &bot.SendPhotoParams{
@@ -287,6 +291,9 @@ func (h *Handler) publishPost(ctx context.Context, userID int64, user *database.
 			Caption:         formattedText,
 			ParseMode:       models.ParseModeHTML,
 		})
+		if sentMsg != nil {
+			allMessageIDs = []int{sentMsg.ID}
+		}
 	} else {
 		// Несколько фото - используем SendMediaGroup
 		media := make([]models.InputMedia, len(content.PhotoIDs))
@@ -310,6 +317,9 @@ func (h *Handler) publishPost(ctx context.Context, userID int64, user *database.
 		err = mediaErr
 		if len(sentMsgs) > 0 {
 			sentMsg = sentMsgs[0]
+			for _, m := range sentMsgs {
+				allMessageIDs = append(allMessageIDs, m.ID)
+			}
 		}
 	}
 
@@ -324,7 +334,7 @@ func (h *Handler) publishPost(ctx context.Context, userID int64, user *database.
 	// Сохраняем пост (проверяем что sentMsg не nil)
 	if sentMsg != nil {
 		expires := time.Now().Add(time.Duration(topic.DurationDays) * 24 * time.Hour)
-		_, _ = h.db.CreatePost(ctx, sentMsg.ID, topic.ID, userID, &content.Text, content.PhotoIDs, expires)
+		_, _ = h.db.CreatePost(ctx, sentMsg.ID, allMessageIDs, topic.ID, userID, &content.Text, content.PhotoIDs, expires)
 	}
 
 	// Очищаем контент и сбрасываем состояние
@@ -943,16 +953,41 @@ func (h *Handler) DeleteExpiredPosts(ctx context.Context) {
 	}
 
 	for _, p := range posts {
-		_, err := h.bot.DeleteMessage(ctx, &bot.DeleteMessageParams{
-			ChatID:    p.ChatID,
-			MessageID: p.MessageID,
-		})
-		if err != nil {
-			log.Printf("Ошибка удаления поста %d: %v", p.MessageID, err)
+		// Удаляем все сообщения поста (media group или одиночное)
+		msgIDs := p.AllMessageIDs
+		if len(msgIDs) == 0 {
+			// Для старых постов без all_message_ids
+			msgIDs = []int{p.MessageID}
+		}
+		for _, msgID := range msgIDs {
+			_, err := h.bot.DeleteMessage(ctx, &bot.DeleteMessageParams{
+				ChatID:    p.ChatID,
+				MessageID: msgID,
+			})
+			if err != nil {
+				log.Printf("Ошибка удаления сообщения %d: %v", msgID, err)
+			}
 		}
 
 		_ = h.db.MarkPostDeleted(ctx, p.ID)
-		log.Printf("Удалён пост %d (chat=%d)", p.MessageID, p.ChatID)
+		log.Printf("Удалён пост %d (chat=%d, сообщений: %d)", p.MessageID, p.ChatID, len(msgIDs))
+
+		// Напоминание пользователю о переопубликации
+		topic, err := h.db.GetTopicByID(ctx, p.InternalTopicID)
+		if err != nil {
+			log.Printf("Ошибка получения темы %d: %v", p.InternalTopicID, err)
+			continue
+		}
+
+		_, _ = h.bot.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: p.UserID,
+			Text:   messages.FormatExpiredReminder(topic.Title, topic.Price, topic.DurationDays),
+			ReplyMarkup: &models.InlineKeyboardMarkup{
+				InlineKeyboard: [][]models.InlineKeyboardButton{{
+					{Text: "🔄 Разместить заново", URL: fmt.Sprintf("https://t.me/%s?start=pay_%d", h.botUsername, topic.ID)},
+				}},
+			},
+		})
 	}
 }
 
