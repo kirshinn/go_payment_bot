@@ -10,6 +10,7 @@ import (
 	"go_payment_bot/config"
 	"go_payment_bot/database"
 	"go_payment_bot/handlers"
+	"go_payment_bot/tglog"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -55,6 +56,7 @@ func main() {
 	}
 	botUsername := me.Username
 	log.Printf("Бот @%s запущен", botUsername)
+	tglog.Init(b, cfg.LogChannelID)
 
 	h := handlers.New(b, cfg, db, botUsername)
 

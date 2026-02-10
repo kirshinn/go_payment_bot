@@ -65,7 +65,7 @@ func FormatSpamWarning(userID int64, firstName string) string {
 
 ⚠️ Публикация номеров телефонов, личных контактов и коротких ссылок запрещена.
 
-Платные объявления — только в разделе «Услуги».`, userID, firstName)
+Объявления — только в разделе «Услуги».`, userID, firstName)
 }
 
 func FormatReloadContent(maxPhotos int) string {

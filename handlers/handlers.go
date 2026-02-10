@@ -15,6 +15,7 @@ import (
 	"go_payment_bot/database"
 	"go_payment_bot/messages"
 	"go_payment_bot/moderation"
+	"go_payment_bot/tglog"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -341,6 +342,8 @@ func (h *Handler) publishPost(ctx context.Context, userID int64, user *database.
 	h.clearPendingContent(userID)
 	_ = h.db.ResetUser(ctx, userID)
 
+	tglog.Send("📝 Опубликовано от user %d — тема «%s» (фото: %d, срок: %d дн.)", userID, topic.Title, len(content.PhotoIDs), topic.DurationDays)
+
 	h.send(ctx, userID, messages.FormatPublished(topic.DurationDays))
 }
 
@@ -614,6 +617,8 @@ func (h *Handler) onPaymentSuccess(ctx context.Context, msg *models.Message) {
 
 	// Обновляем статус
 	_ = h.db.MarkUserPaid(ctx, userID, topic.ID)
+
+	tglog.Send("💰 Оплата %d ₽ от %s (id: %d) — тема «%s»", p.TotalAmount/100, msg.From.FirstName, userID, topic.Title)
 
 	h.send(ctx, userID, messages.FormatPaymentSuccess(topic.MaxPhotos))
 }
@@ -979,6 +984,8 @@ func (h *Handler) DeleteExpiredPosts(ctx context.Context) {
 			continue
 		}
 
+		tglog.Send("🗑 Удалён просроченный пост от user %d — тема «%s»", p.UserID, topic.Title)
+
 		_, _ = h.bot.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID: p.UserID,
 			Text:   messages.FormatExpiredReminder(topic.Title, topic.Price, topic.DurationDays),
@@ -1034,6 +1041,7 @@ func (h *Handler) handleSpamViolation(ctx context.Context, msg *models.Message, 
 	}()
 
 	log.Printf("Спам от user=%d: type=%s match=%s", msg.From.ID, violation.Type, violation.Match)
+	tglog.Send("🚫 Спам от %s (id: %d) — %s: %s", msg.From.FirstName, msg.From.ID, violation.Type, violation.Match)
 }
 
 func (h *Handler) LoadAllowedDomains(ctx context.Context) {
