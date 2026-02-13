@@ -79,7 +79,19 @@ func (h *Handler) OnMessage(ctx context.Context, b *bot.Bot, update *models.Upda
 		return
 	}
 
-	// === МОДЕРАЦИЯ СПАМА ВО ВСЕХ ТОПИКАХ ===
+	// Проверяем, это сообщение в отслеживаемой теме (платные объявления)?
+	// Если да — пропускаем спам-модерацию, там своя логика (удаление + кнопка оплаты)
+	if msg.Chat.Type == "supergroup" && msg.MessageThreadID != 0 {
+		topic, err := h.db.GetTopicByGroupAndTopicID(ctx, msg.Chat.ID, msg.MessageThreadID)
+		if err == nil && topic.IsActive {
+			if msg.From != nil && !msg.From.IsBot {
+				h.onServicesTopicMessage(ctx, msg, topic)
+			}
+			return
+		}
+	}
+
+	// === МОДЕРАЦИЯ СПАМА В ОСТАЛЬНЫХ ТОПИКАХ ===
 	if msg.Chat.Type == "supergroup" && msg.From != nil && !msg.From.IsBot {
 		text := msg.Text
 		if msg.Caption != "" {
@@ -91,17 +103,6 @@ func (h *Handler) OnMessage(ctx context.Context, b *bot.Bot, update *models.Upda
 				h.handleSpamViolation(ctx, msg, violation)
 				return
 			}
-		}
-	}
-
-	// Проверяем, это сообщение в отслеживаемой теме (платные объявления)?
-	if msg.Chat.Type == "supergroup" && msg.MessageThreadID != 0 {
-		topic, err := h.db.GetTopicByGroupAndTopicID(ctx, msg.Chat.ID, msg.MessageThreadID)
-		if err == nil && topic.IsActive {
-			if msg.From != nil && !msg.From.IsBot {
-				h.onServicesTopicMessage(ctx, msg, topic)
-			}
-			return
 		}
 	}
 
